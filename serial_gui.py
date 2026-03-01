@@ -185,6 +185,37 @@ class SerialGUI:
         self.last_sample_time = time.time()
         self.current_sps = 0
         
+        # Ground Station Protocol Variables
+        self.packet_pt = tk.DoubleVar(value=0.0)
+        self.packet_tank = tk.DoubleVar(value=0.0)
+        self.packet_engine = tk.DoubleVar(value=0.0)
+        self.packet_cont1 = tk.IntVar(value=0)
+        self.packet_cont2 = tk.IntVar(value=0)
+        self.packet_state = tk.IntVar(value=0)
+        self.packet_state_text = tk.StringVar(value="UNARMED")
+        
+        self.command_msg_id = 0
+        self.pending_acks = {} # Map msg_id -> {timestamp, retry_count, command_str}
+        self.ack_timeout = 0.1 # 100ms before retry
+        self.max_retries = 30  # Increase retries for faster checking (3s total)
+        
+        # Plotting - Multi-plot support
+        self.channel_plot_assignments = {} # channel_name -> plot_id (int, 1-based)
+        self.plot_widgets = {} # plot_id -> pg.PlotWidget
+        self.plot_curves = {} # (plot_id, channel_name) -> curve_item
+        self.plot_layouts = None # Reference to the layout managing plots
+        
+        # State mapping
+        self.state_map = {
+            0: "UNARMED",
+            1: "ARMED",
+            2: "LOADING",
+            3: "LOADED",
+            4: "FIRE",
+            5: "PURGE",
+            6: "PURGED"
+        }
+
         # Global sample counter for plot x-axis (maintains sample number since boot)
         self.global_sample_counter = 0
         
@@ -228,6 +259,10 @@ class SerialGUI:
         self.notebook = ttk.Notebook(self.root)
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
         
+        # Create Ground Station tab
+        self.gs_frame = ttk.Frame(self.notebook)
+        self.notebook.add(self.gs_frame, text="Ground Station")
+        
         # Create Connection tab
         self.connection_frame = ttk.Frame(self.notebook)
         self.notebook.add(self.connection_frame, text="Connection")
@@ -235,6 +270,9 @@ class SerialGUI:
         # Create Plot tab (empty for now)
         self.plot_frame = ttk.Frame(self.notebook)
         self.notebook.add(self.plot_frame, text="Plot")
+        
+        # Setup Ground Station tab content
+        self.create_ground_station_content()
         
         # Setup Connection tab content
         self.create_connection_content()
@@ -354,6 +392,191 @@ class SerialGUI:
         else:
             self.status_canvas.itemconfig(self.status_circle, fill="red", outline="darkred")
     
+    def create_ground_station_content(self):
+        """Create content for the Ground Station tab"""
+        # Main layout frame
+        gs_layout = ttk.Frame(self.gs_frame, padding=10)
+        gs_layout.pack(fill=tk.BOTH, expand=True)
+
+        # ---- Telemetry Monitor (Left Side) ----
+        telemetry_frame = ttk.LabelFrame(gs_layout, text="Live Telemetry", padding=10)
+        telemetry_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
+
+        # Create grid for telemetry data
+        for i in range(6):
+            telemetry_frame.grid_columnconfigure(0, weight=1)
+            telemetry_frame.grid_columnconfigure(1, weight=2)
+            telemetry_frame.grid_rowconfigure(i, weight=1)
+
+        # Style for big labels
+        self.root.option_add("*TLabel*Font", ("Arial", 12))
+        
+        # 1. Pressure Transducer (PT)
+        ttk.Label(telemetry_frame, text="Pressure (PT):", font=("Arial", 14, "bold")).grid(row=0, column=0, sticky=tk.W, pady=5)
+        self.lbl_pt = ttk.Label(telemetry_frame, text="-- PSI", font=("Courier New", 24, "bold"), foreground="blue")
+        self.lbl_pt.grid(row=0, column=1, sticky=tk.E, pady=5)
+
+        # 2. Tank Load Cell
+        ttk.Label(telemetry_frame, text="Tank Thrust:", font=("Arial", 14, "bold")).grid(row=1, column=0, sticky=tk.W, pady=5)
+        self.lbl_tank = ttk.Label(telemetry_frame, text="-- lbs", font=("Courier New", 24, "bold"), foreground="green")
+        self.lbl_tank.grid(row=1, column=1, sticky=tk.E, pady=5)
+
+        # 3. Engine Load Cell
+        ttk.Label(telemetry_frame, text="Engine Thrust:", font=("Arial", 14, "bold")).grid(row=2, column=0, sticky=tk.W, pady=5)
+        self.lbl_engine = ttk.Label(telemetry_frame, text="-- lbs", font=("Courier New", 24, "bold"), foreground="red")
+        self.lbl_engine.grid(row=2, column=1, sticky=tk.E, pady=5)
+
+        # 4. Continuity 1
+        ttk.Label(telemetry_frame, text="Launch Pyro Cont:", font=("Arial", 12)).grid(row=3, column=0, sticky=tk.W, pady=5)
+        self.lbl_cont1 = ttk.Label(telemetry_frame, text="UNK", font=("Arial", 16, "bold"), foreground="grey")
+        self.lbl_cont1.grid(row=3, column=1, sticky=tk.E, pady=5)
+
+        # 5. Continuity 2
+        ttk.Label(telemetry_frame, text="Spare Pyro Cont:", font=("Arial", 12)).grid(row=4, column=0, sticky=tk.W, pady=5)
+        self.lbl_cont2 = ttk.Label(telemetry_frame, text="UNK", font=("Arial", 16, "bold"), foreground="grey")
+        self.lbl_cont2.grid(row=4, column=1, sticky=tk.E, pady=5)
+
+        # 6. System State
+        ttk.Label(telemetry_frame, text="System State:", font=("Arial", 14, "bold")).grid(row=5, column=0, sticky=tk.W, pady=5)
+        self.lbl_state = ttk.Label(telemetry_frame, text="UNKNOWN", font=("Arial", 28, "bold"), foreground="black", background="#f0f0f0")
+        self.lbl_state.grid(row=5, column=1, sticky=tk.E, pady=5)
+
+        # ---- Command Center (Right Side) ----
+        command_frame = ttk.LabelFrame(gs_layout, text="Command Center", padding=10)
+        command_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(5, 0))
+
+        # Command Buttons
+        btn_style = {"width": 15, "padding": 5}
+        
+        # Row 0: Safety
+        ttk.Button(command_frame, text="DISARM (0)", command=lambda: self.send_gs_command(0), width=20).pack(fill=tk.X, pady=5)
+        ttk.Button(command_frame, text="ARM (1)", command=lambda: self.send_gs_command(1), width=20).pack(fill=tk.X, pady=5)
+        
+        ttk.Separator(command_frame, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=10)
+
+        # Row 1: Loading
+        ttk.Button(command_frame, text="LOAD (2)", command=lambda: self.send_gs_command(2), width=20).pack(fill=tk.X, pady=5)
+        ttk.Button(command_frame, text="LOADED (3)", command=lambda: self.send_gs_command(3), width=20).pack(fill=tk.X, pady=5)
+
+        ttk.Separator(command_frame, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=10)
+
+        # Row 2: Operation
+        fire_btn = tk.Button(command_frame, text="FIRE (4)", command=lambda: self.send_gs_command(4), 
+                             bg="red", fg="white", font=("Arial", 12, "bold"), height=2)
+        fire_btn.pack(fill=tk.X, pady=5)
+
+        ttk.Separator(command_frame, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=10)
+        
+        # Row 3: Purge
+        ttk.Button(command_frame, text="PURGE (5)", command=lambda: self.send_gs_command(5), width=20).pack(fill=tk.X, pady=5)
+        ttk.Button(command_frame, text="PURGED (6)", command=lambda: self.send_gs_command(6), width=20).pack(fill=tk.X, pady=5)
+
+        # Command Status Log
+        ttk.Label(command_frame, text="Last Command Status:").pack(anchor=tk.W, pady=(10, 0))
+        self.cmd_status_var = tk.StringVar(value="Ready")
+        ttk.Label(command_frame, textvariable=self.cmd_status_var, wraplength=200, foreground="blue").pack(anchor=tk.W)
+
+    def update_telemetry_display(self, pt, tank, engine, cont1, cont2, state):
+        """Update the GUI labels with new telemetry data"""
+        try:
+            self.lbl_pt.config(text=f"{pt:.1f} PSI")
+            self.lbl_tank.config(text=f"{tank:.1f} lbs")
+            self.lbl_engine.config(text=f"{engine:.1f} lbs")
+            
+            # Continuity Logic
+            c1_text = "GOOD (1)" if cont1 == 1 else "BAD (0)"
+            c1_color = "green" if cont1 == 1 else "red"
+            self.lbl_cont1.config(text=c1_text, foreground=c1_color)
+
+            c2_text = "GOOD (1)" if cont2 == 1 else "BAD (0)"
+            c2_color = "green" if cont2 == 1 else "red"
+            self.lbl_cont2.config(text=c2_text, foreground=c2_color)
+
+            # State Logic
+            state_text = self.state_map.get(state, f"UNKNOWN ({state})")
+            state_colors = {
+                0: "gray", # UNARMED
+                1: "orange", # ARMED
+                2: "blue", # LOADING
+                3: "purple", # LOADED
+                4: "red", # FIRE
+                5: "cyan", # PURGE
+                6: "green" # PURGED
+            }
+            bg_color = state_colors.get(state, "white")
+            self.lbl_state.config(text=state_text, background=bg_color)
+            
+        except Exception as e:
+            print(f"Update error: {e}")
+
+    def send_gs_command(self, op_code):
+        """Send a ground station command with retry logic"""
+        if not self.is_connected:
+            messagebox.showerror("Error", "Not connected to XBee!")
+            return
+
+        # Generate Message ID (0-255)
+        msg_id = self.command_msg_id
+        self.command_msg_id = (self.command_msg_id + 1) % 256
+        
+        # Construct packet: CMD,[OP_CODE],[MSG_ID]
+        cmd_str = f"CMD,{op_code},{msg_id}"
+        
+        # Add to pending ACKs
+        self.pending_acks[msg_id] = {
+            "cmd": cmd_str,
+            "retries": 0,
+            "last_sent": time.time()
+        }
+        
+        # Send immediately
+        self.send_serial_packet(cmd_str)
+        self.log_message(f"Sending: {cmd_str}", "SENT")
+        self.cmd_status_var.set(f"Sent: {cmd_str} (Waiting ACK...)")
+        
+        # Schedule check for ACK
+        delay_ms = int(self.ack_timeout * 1000)
+        self.root.after(delay_ms, lambda: self.check_ack_timeout(msg_id))
+
+    def send_serial_packet(self, packet):
+        """Helper to send string packet logic"""
+        if self.serial_connection:
+            try:
+                # Assuming protocol requires newline at end? 
+                # User prompted format: CMD,[OP_CODE],[MSG_ID]
+                # It likely needs a terminator like \n or \r\n, though prompt didn't specify for Tx.
+                # Assuming standard ASCII line transmission.
+                full_packet = packet + "\n" 
+                self.serial_connection.write(full_packet.encode('utf-8'))
+            except Exception as e:
+                self.log_message(f"Send failed: {e}", "ERROR")
+
+    def check_ack_timeout(self, msg_id):
+        """Check if ACK was received, otherwise retry"""
+        if msg_id not in self.pending_acks:
+            return  # ACK received already
+
+        data = self.pending_acks[msg_id]
+        if data["retries"] < self.max_retries:
+            # Retry
+            data["retries"] += 1
+            data["last_sent"] = time.time()
+            self.pending_acks[msg_id] = data # Update
+            
+            self.log_message(f"Retry {data['retries']}/{self.max_retries}: {data['cmd']}", "SENT")
+            self.cmd_status_var.set(f"Retry {data['retries']}: {data['cmd']}")
+            self.send_serial_packet(data["cmd"])
+            
+            # Check again after delay
+            delay_ms = int(self.ack_timeout * 1000)
+            self.root.after(delay_ms, lambda: self.check_ack_timeout(msg_id))
+        else:
+            # Failed
+            self.log_message(f"Command Failed (No ACK): {data['cmd']}", "ERROR")
+            self.cmd_status_var.set(f"FAILED: {data['cmd']} (No response)")
+            if msg_id in self.pending_acks:
+                del self.pending_acks[msg_id]
+
     def create_connection_content(self):
         """Create all content for the Connection tab"""
         self.create_connection_frame()
@@ -1218,7 +1441,6 @@ For technical support, refer to the README.md file."""
             
         # Create PyQtGraph widget in a separate window
         self.plot_window = None
-        self.plot_widget = None
         
         # Control buttons for plot
         plot_control_frame = ttk.Frame(plot_container)
@@ -1226,6 +1448,10 @@ For technical support, refer to the README.md file."""
         
         self.show_plot_btn = ttk.Button(plot_control_frame, text="Show Plot Window", command=self.show_plot_window)
         self.show_plot_btn.pack(side=tk.LEFT, padx=(0, 10))
+        
+        self.refresh_plots_btn = ttk.Button(plot_control_frame, text="Refresh Plots", command=self.refresh_plot_layout)
+        self.refresh_plots_btn.pack(side=tk.LEFT, padx=(0, 10))
+        ToolTip(self.refresh_plots_btn, "Rebuild plot window to reflect plot assignments")
         
         self.pause_plot_btn = ttk.Button(plot_control_frame, text="Pause Plot", command=self.toggle_plot_pause)
         self.pause_plot_btn.pack(side=tk.LEFT, padx=(0, 10))
@@ -1312,7 +1538,7 @@ For technical support, refer to the README.md file."""
     
     def update_x_axis_label(self):
         """Update the X-axis label based on selection and custom override"""
-        if hasattr(self, 'plot_widget') and self.plot_widget is not None:
+        if hasattr(self, 'plot_widgets') and self.plot_widgets:
             try:
                 if PYQTGRAPH_AVAILABLE:
                     # Use custom label if provided, otherwise use default based on selection
@@ -1329,7 +1555,8 @@ For technical support, refer to the README.md file."""
                             else:
                                 label = channel_name
                     
-                    self.plot_widget.setLabel('bottom', label)
+                    for pw in self.plot_widgets.values():
+                        pw.setLabel('bottom', label)
             except:
                 pass
     
@@ -1340,7 +1567,7 @@ For technical support, refer to the README.md file."""
     
     def update_y_axis_label(self):
         """Update the Y-axis label based on custom override"""
-        if hasattr(self, 'plot_widget') and self.plot_widget is not None:
+        if hasattr(self, 'plot_widgets') and self.plot_widgets:
             try:
                 if PYQTGRAPH_AVAILABLE:
                     # Use custom label if provided, otherwise use default
@@ -1349,7 +1576,8 @@ For technical support, refer to the README.md file."""
                     else:
                         label = "Value"  # Default Y-axis label
                     
-                    self.plot_widget.setLabel('left', label)
+                    for pw in self.plot_widgets.values():
+                        pw.setLabel('left', label)
             except:
                 pass
     
@@ -1360,7 +1588,7 @@ For technical support, refer to the README.md file."""
     
     def update_plot_title(self):
         """Update the plot title based on custom override"""
-        if hasattr(self, 'plot_widget') and self.plot_widget is not None:
+        if hasattr(self, 'plot_widgets') and self.plot_widgets:
             try:
                 if PYQTGRAPH_AVAILABLE:
                     # Use custom title if provided, otherwise use default
@@ -1369,12 +1597,72 @@ For technical support, refer to the README.md file."""
                     else:
                         title = "Serial Data Plot"  # Default plot title
                     
-                    self.plot_widget.setTitle(title) # type: ignore
+                    # Only set title on first plot? Or all? Let's do first for now to save space
+                    if 1 in self.plot_widgets:
+                        self.plot_widgets[1].setTitle(title)
             except:
                 pass
     
     def parse_plot_data(self, raw_data: str):
-        """Parse incoming data for plotting"""
+        """Parse incoming data for Ground Station Protocol or generic plotting"""
+        raw_data = raw_data.strip()
+        
+        # 1. Check for ACK first
+        if raw_data.startswith("ACK,"):
+            try:
+                parts = raw_data.split(',')
+                if len(parts) == 2:
+                    msg_id = int(parts[1])
+                    if msg_id in self.pending_acks:
+                        cmd = self.pending_acks[msg_id]['cmd']
+                        self.log_message(f"ACK Received for {msg_id}: {cmd}", "SYSTEM")
+                        self.cmd_status_var.set(f"SUCCESS: {cmd}")
+                        del self.pending_acks[msg_id]
+                    return  # Stop processing ACK as plot data
+            except ValueError:
+                pass
+
+        # 2. Try parsing as Ground Station Telemetry
+        # [PT], [Tank], [Engine], [Cont1], [Cont2], [State]
+        is_telemetry = False
+        try:
+            parts = raw_data.split(',')
+            if len(parts) == 6:
+                # Attempt to parse values
+                pt = float(parts[0])
+                tank = float(parts[1])
+                engine = float(parts[2])
+                cont1 = int(float(parts[3]))
+                cont2 = int(float(parts[4]))
+                state = int(float(parts[5]))
+                
+                # Update Ground Station Display
+                self.root.after(0, lambda p=pt, t=tank, e=engine, c1=cont1, c2=cont2, s=state: self.update_telemetry_display(p, t, e, c1, c2, s))
+                
+                # Prepare data for plotting
+                parsed_channels = {
+                    "PT": pt,
+                    "Tank_Thrust": tank,
+                    "Engine_Thrust": engine,
+                    "Cont1": cont1,
+                    "Cont2": cont2,
+                    "State": state
+                }
+                
+                # Update plot data
+                self.global_sample_counter += 1
+                self.update_plot_channels(parsed_channels, self.global_sample_counter)
+                is_telemetry = True
+                
+        except ValueError:
+            pass
+            
+        if is_telemetry:
+            return
+
+        # 3. Fallback: DISABLE generic "ChX" parsing to prevent clutter
+        # Only allow explicit named channels (e.g. "Name:Value") if strictly needed,
+        # otherwise ignoring other formats prevents "Ch1, Ch2..." from appearing.
         try:
             # Split by delimiter
             parts = raw_data.strip().split(self.delimiter)
@@ -1383,7 +1671,7 @@ For technical support, refer to the README.md file."""
             for i, part in enumerate(parts):
                 part = part.strip()
                 if ':' in part:
-                    # Named channel format "name:value"
+                    # Named channel format "name:value" - Allow this for specific debug data or test mode
                     name, value_str = part.split(':', 1)
                     name = name.strip()
                     try:
@@ -1391,14 +1679,7 @@ For technical support, refer to the README.md file."""
                         parsed_channels[name] = value
                     except ValueError:
                         continue
-                else:
-                    # Unnamed channel, use index
-                    try:
-                        value = float(part)
-                        channel_name = f"Ch{i+1}"
-                        parsed_channels[channel_name] = value
-                    except ValueError:
-                        continue
+                # ELSE: Do NOT automatically create Ch1, Ch2, etc.
             
             # Update plot data (increment sample counter once per line)
             if parsed_channels:
@@ -1419,52 +1700,61 @@ For technical support, refer to the README.md file."""
                 self.channel_visibility[channel_name] = True
                 
                 # Set default thickness and color
-                self.channel_thickness[channel_name] = 2
-                color_index = len(self.channel_colors) % len(self.plot_colors)
-                self.channel_colors[channel_name] = self.plot_colors[color_index]
+                if channel_name not in self.channel_thickness:
+                    self.channel_thickness[channel_name] = 2
+                
+                if channel_name not in self.channel_colors:
+                    color_index = len(self.channel_colors) % len(self.plot_colors)
+                    self.channel_colors[channel_name] = self.plot_colors[color_index]
                 
                 # Set default dot size and line visibility
-                self.channel_dot_size[channel_name] = 4
-                self.channel_show_line[channel_name] = True
+                if channel_name not in self.channel_dot_size:
+                    self.channel_dot_size[channel_name] = 0
+                
+                if channel_name not in self.channel_show_line:
+                    self.channel_show_line[channel_name] = True
                 
                 self.add_channel_control(channel_name)
                 
                 # Update x-axis dropdown with new channel
                 self.update_xaxis_dropdown()
                 
-                # Add plot curve if plot widget exists
-                if hasattr(self, 'plot_widget') and self.plot_widget is not None:
+                # If plot window already open, add curve dynamically 
+                # (Normally handled by show_plot_window loop, but good for new channels appearing mid-stream)
+                if hasattr(self, 'plot_widgets') and self.plot_widgets:
                     try:
                         if PYQTGRAPH_AVAILABLE:
-                            # Use custom thickness, color, dot size, and line visibility
-                            thickness = self.channel_thickness[channel_name]
-                            color = self.channel_colors[channel_name]
-                            dot_size = self.channel_dot_size[channel_name]
-                            show_line = self.channel_show_line[channel_name]
-                            
-                            # Set up pen (line)
-                            pen = pg.mkPen(color=color, width=thickness) if show_line else None
-                            
-                            # Set up symbol (dots)
-                            symbol = 'o' if dot_size > 0 else None
-                            symbol_size = dot_size if dot_size > 0 else 1
-                            
-                            curve = self.plot_widget.plot(
-                                pen=pen, 
-                                symbol=symbol, 
-                                symbolSize=symbol_size,
-                                symbolBrush=color, 
-                                name=channel_name
-                            )
-                        else:
-                            # Fallback for dummy mode
-                            color = self.channel_colors[channel_name]
-                            curve = self.plot_widget.plot(pen=color, name=channel_name)
-                        self.plot_curves[channel_name] = curve
-                        # Add to legend if it exists
-                        if hasattr(self, 'plot_legend') and self.plot_legend is not None:
-                            display_name = self.channel_custom_names.get(channel_name, channel_name)
-                            self.plot_legend.addItem(curve, display_name)
+                            plot_id = self.channel_plot_assignments.get(channel_name, 1)
+                            if plot_id in self.plot_widgets:
+                                pw = self.plot_widgets[plot_id]
+                                
+                                # Use custom thickness, color, dot size, and line visibility
+                                thickness = self.channel_thickness[channel_name]
+                                color = self.channel_colors[channel_name]
+                                dot_size = self.channel_dot_size[channel_name]
+                                show_line = self.channel_show_line[channel_name]
+                                
+                                # Set up pen (line)
+                                pen = pg.mkPen(color=color, width=thickness) if show_line else None
+                                
+                                # Set up symbol (dots)
+                                symbol = 'o' if dot_size > 0 else None
+                                symbol_size = dot_size if dot_size > 0 else 1
+                                
+                                curve = pw.plot(
+                                    pen=pen, 
+                                    symbol=symbol, 
+                                    symbolSize=symbol_size,
+                                    symbolBrush=color, 
+                                    name=channel_name
+                                )
+                                self.plot_curves[(plot_id, channel_name)] = curve
+                                
+                                # Add to legend if exists
+                                if plot_id in self.plot_legends:
+                                    legend = self.plot_legends[plot_id]
+                                    display_name = self.channel_custom_names.get(channel_name, channel_name)
+                                    legend.addItem(curve, display_name)
                     except:
                         pass
             
@@ -1475,7 +1765,7 @@ For technical support, refer to the README.md file."""
         self.schedule_plot_update()
     
     def add_channel_control(self, channel_name: str):
-        """Add visibility control for a channel with thickness and color options"""
+        """Add visibility control for a channel with thickness, color, and PLOT ID options"""
         # Clear only the "No channels detected" message if it's the first channel
         if len(self.plot_data) == 1:
             # Only destroy the "No channels detected" label, preserve Y-axis label frame
@@ -1486,6 +1776,10 @@ For technical support, refer to the README.md file."""
             
             for widget in widgets_to_remove:
                 widget.destroy()
+        
+        # Initialize plot assignment if not exists
+        if channel_name not in self.channel_plot_assignments:
+            self.channel_plot_assignments[channel_name] = 1 # Default to Plot 1
         
         # Create frame for this channel's controls
         channel_control_frame = ttk.Frame(self.channel_frame, relief="solid", borderwidth=1, padding=3)
@@ -1501,6 +1795,19 @@ For technical support, refer to the README.md file."""
         )
         checkbox.pack(side=tk.LEFT, padx=(0, 10))
         
+        # Plot Assignment (NEW)
+        ttk.Label(channel_control_frame, text="Plot #:").pack(side=tk.LEFT, padx=(5, 0))
+        plot_var = tk.StringVar(value=str(self.channel_plot_assignments[channel_name]))
+        plot_spin = ttk.Spinbox(
+            channel_control_frame,
+            from_=1, to=4, width=3,
+            textvariable=plot_var,
+            command=lambda: self.update_channel_plot_assignment(channel_name, plot_var.get())
+        )
+        plot_spin.pack(side=tk.LEFT, padx=(2, 10))
+        plot_spin.bind('<Return>', lambda e: self.update_channel_plot_assignment(channel_name, plot_var.get()))
+        plot_spin.bind('<FocusOut>', lambda e: self.update_channel_plot_assignment(channel_name, plot_var.get()))
+        
         # Channel name override field
         ttk.Label(channel_control_frame, text="Name:").pack(side=tk.LEFT, padx=(0, 2))
         name_var = tk.StringVar(value=channel_name)
@@ -1510,7 +1817,7 @@ For technical support, refer to the README.md file."""
         name_entry.bind('<FocusOut>', lambda e: self.update_channel_name(channel_name, name_var.get()))
         
         # Line thickness control
-        ttk.Label(channel_control_frame, text="Thickness:").pack(side=tk.LEFT, padx=(0, 2))
+        ttk.Label(channel_control_frame, text="Thick:").pack(side=tk.LEFT, padx=(0, 2))
         thickness_var = tk.StringVar(value=str(self.channel_thickness[channel_name]))
         thickness_spinbox = ttk.Spinbox(
             channel_control_frame,
@@ -1525,14 +1832,14 @@ For technical support, refer to the README.md file."""
         # Color selection button
         color_btn = tk.Button(
             channel_control_frame,
-            text="Color",
-            width=8,
+            text="", # Color shows in bg
+            width=3,
             command=lambda: self.choose_channel_color(channel_name)
         )
         color_btn.pack(side=tk.LEFT, padx=(0, 10))
         
         # Dot size control
-        ttk.Label(channel_control_frame, text="Dot Size:").pack(side=tk.LEFT, padx=(0, 2))
+        ttk.Label(channel_control_frame, text="Dot:").pack(side=tk.LEFT, padx=(0, 2))
         dot_size_var = tk.StringVar(value=str(self.channel_dot_size[channel_name]))
         dot_size_spinbox = ttk.Spinbox(
             channel_control_frame,
@@ -1548,11 +1855,12 @@ For technical support, refer to the README.md file."""
         line_var = tk.BooleanVar(value=self.channel_show_line[channel_name])
         line_checkbox = ttk.Checkbutton(
             channel_control_frame,
-            text="Show Line",
+            text="Ln",
             variable=line_var,
             command=lambda: self.toggle_channel_line(channel_name, line_var.get())
         )
         line_checkbox.pack(side=tk.LEFT, padx=(0, 5))
+        ToolTip(line_checkbox, "Show connecting lines")
         
         # Store references
         setattr(self, f"channel_var_{channel_name}", var)
@@ -1567,7 +1875,33 @@ For technical support, refer to the README.md file."""
         
         # Update button color to show current selection
         self.update_color_button_appearance(channel_name)
-    
+
+    def update_channel_plot_assignment(self, channel_name, plot_id_str):
+        """Update which plot a channel belongs to"""
+        try:
+            old_id = self.channel_plot_assignments.get(channel_name, 1)
+            new_id = int(plot_id_str)
+            if new_id < 1: new_id = 1
+            if new_id > 8: new_id = 8 # Limit max plots
+            
+            self.channel_plot_assignments[channel_name] = new_id
+            
+            if old_id != new_id:
+                # If plot window open, we need to refresh/rebuild it
+                if self.plot_window is not None:
+                    # Provide visual feedback that refresh is needed or do it auto?
+                    # Auto-refreshing layout might be heavy, but let's try auto-reload of curves
+                    self.show_plot_window() # Re-calls logic to distribute curves
+        except ValueError:
+            pass
+
+    def refresh_plot_layout(self):
+        """Force rebuild of plot window layout"""
+        if self.plot_window:
+            self.plot_window.close()
+            self.root.after(100, self.show_plot_window)
+
+
     def toggle_channel_visibility(self, channel_name: str, visible: bool):
         """Toggle visibility of a plot channel"""
         self.channel_visibility[channel_name] = visible
@@ -1634,21 +1968,22 @@ For technical support, refer to the README.md file."""
             pass
     
     def update_channel_thickness(self, channel_name: str, thickness_str: str):
-        """Update line thickness for a channel"""
+        """Update line thickness for a channel - Multi-plot Aware"""
         try:
             thickness = int(thickness_str)
             thickness = max(1, min(10, thickness))  # Clamp between 1 and 10
             self.channel_thickness[channel_name] = thickness
             
-            # Update the plot curve if it exists
-            if channel_name in self.plot_curves and hasattr(self, 'plot_widget') and self.plot_widget is not None:
-                try:
-                    if PYQTGRAPH_AVAILABLE:
-                        color = self.channel_colors[channel_name]
-                        pen = pg.mkPen(color=color, width=thickness)
-                        self.plot_curves[channel_name].setPen(pen)
-                except:
-                    pass
+            # Find curve in any plot
+            for (pid, cname), curve in self.plot_curves.items():
+                if cname == channel_name:
+                    try:
+                        if PYQTGRAPH_AVAILABLE:
+                            color = self.channel_colors[channel_name]
+                            pen = pg.mkPen(color=color, width=thickness)
+                            curve.setPen(pen)
+                    except:
+                        pass
                     
         except ValueError:
             # Reset to current value if invalid input
@@ -1657,26 +1992,26 @@ For technical support, refer to the README.md file."""
                 thickness_var.set(str(self.channel_thickness[channel_name]))
     
     def update_channel_dot_size(self, channel_name: str, dot_size_str: str):
-        """Update dot size for a channel"""
+        """Update dot size for a channel - Multi-plot Aware"""
         try:
             dot_size = int(dot_size_str)
             dot_size = max(0, min(20, dot_size))  # Clamp between 0 and 20
             self.channel_dot_size[channel_name] = dot_size
             
-            # Update the plot curve if it exists
-            if channel_name in self.plot_curves and hasattr(self, 'plot_widget') and self.plot_widget is not None:
-                try:
-                    if PYQTGRAPH_AVAILABLE:
-                        curve = self.plot_curves[channel_name]
-                        color = self.channel_colors[channel_name]
-                        if dot_size > 0:
-                            curve.setSymbol('o')
-                            curve.setSymbolSize(dot_size)
-                            curve.setSymbolBrush(color)
-                        else:
-                            curve.setSymbol(None)  # No dots
-                except:
-                    pass
+            # Find curve in any plot
+            for (pid, cname), curve in self.plot_curves.items():
+                if cname == channel_name:
+                    try:
+                        if PYQTGRAPH_AVAILABLE:
+                            color = self.channel_colors[channel_name]
+                            if dot_size > 0:
+                                curve.setSymbol('o')
+                                curve.setSymbolSize(dot_size)
+                                curve.setSymbolBrush(color)
+                            else:
+                                curve.setSymbol(None)  # No dots
+                    except:
+                        pass
                     
         except ValueError:
             # Reset to current value if invalid input
@@ -1685,25 +2020,23 @@ For technical support, refer to the README.md file."""
                 dot_size_var.set(str(self.channel_dot_size[channel_name]))
     
     def toggle_channel_line(self, channel_name: str, show_line: bool):
-        """Toggle line visibility for a channel"""
+        """Toggle line visibility for a channel - Multi-plot Aware"""
         self.channel_show_line[channel_name] = show_line
         
-        # Update the plot curve if it exists
-        if channel_name in self.plot_curves and hasattr(self, 'plot_widget') and self.plot_widget is not None:
-            try:
-                if PYQTGRAPH_AVAILABLE:
-                    curve = self.plot_curves[channel_name]
-                    if show_line:
-                        # Show line with current thickness and color
-                        thickness = self.channel_thickness[channel_name]
-                        color = self.channel_colors[channel_name]
-                        pen = pg.mkPen(color=color, width=thickness)
-                        curve.setPen(pen)
-                    else:
-                        # Hide line
-                        curve.setPen(None)
-            except:
-                pass
+        # Find curve in any plot
+        for (pid, cname), curve in self.plot_curves.items():
+            if cname == channel_name:
+                try:
+                    if PYQTGRAPH_AVAILABLE:
+                        if show_line:
+                            thickness = self.channel_thickness[channel_name]
+                            color = self.channel_colors[channel_name]
+                            pen = pg.mkPen(color=color, width=thickness)
+                            curve.setPen(pen)
+                        else:
+                            curve.setPen(None)
+                except:
+                    pass
     
     def update_channel_name(self, channel_name: str, new_name: str):
         """Update custom display name for a channel"""
@@ -1717,19 +2050,12 @@ For technical support, refer to the README.md file."""
             # Update x-axis dropdown with new display name
             self.update_xaxis_dropdown()
             
-            # Update legend if it exists and plot widget is available
-            if (hasattr(self, 'plot_legend') and self.plot_legend is not None and 
-                channel_name in self.plot_curves and hasattr(self, 'plot_widget') and self.plot_widget is not None):
-                try:
-                    if PYQTGRAPH_AVAILABLE:
-                        # Rebuild legend with updated names
-                        self.plot_legend.clear() # type: ignore
-                        for ch_name, ch_curve in self.plot_curves.items():
-                            ch_display_name = self.channel_custom_names.get(ch_name, ch_name)
-                            self.plot_legend.addItem(ch_curve, ch_display_name)
-                except Exception as e:
-                    # Silently fail - legend update is non-critical
-                    pass
+            # Refresh Legend in all plots
+            # Since plots are managed by plot_widgets dict, we rely on refresh or manual iteration
+            # Simplest for now is just update if we have references, but refresh button is cleaner
+            # We will rely on user clicking "Refresh Plots" to fully update legends if complex
+            pass
+
         else:
             # Reset to original name if empty
             name_var = getattr(self, f"name_var_{channel_name}", None)
@@ -1737,7 +2063,7 @@ For technical support, refer to the README.md file."""
                 name_var.set(self.channel_custom_names[channel_name])
     
     def choose_channel_color(self, channel_name: str):
-        """Open color chooser dialog for a channel"""
+        """Open color chooser dialog for a channel - Multi-plot Aware"""
         current_color = self.channel_colors[channel_name]
         color = colorchooser.askcolor(color=current_color, title=f"Choose color for {channel_name}")
         
@@ -1747,16 +2073,17 @@ For technical support, refer to the README.md file."""
             # Update button appearance
             self.update_color_button_appearance(channel_name)
             
-            # Update the plot curve if it exists
-            if channel_name in self.plot_curves and hasattr(self, 'plot_widget') and self.plot_widget is not None:
-                try:
-                    if PYQTGRAPH_AVAILABLE:
-                        thickness = self.channel_thickness[channel_name]
-                        pen = pg.mkPen(color=color[1], width=thickness)
-                        self.plot_curves[channel_name].setPen(pen)
-                        self.plot_curves[channel_name].setSymbolBrush(color[1])
-                except:
-                    pass
+            # Find curve in any plot
+            for (pid, cname), curve in self.plot_curves.items():
+                if cname == channel_name:
+                    try:
+                        if PYQTGRAPH_AVAILABLE:
+                            thickness = self.channel_thickness[channel_name]
+                            pen = pg.mkPen(color=color[1], width=thickness)
+                            curve.setPen(pen)
+                            curve.setSymbolBrush(color[1])
+                    except:
+                        pass
     
     def update_color_button_appearance(self, channel_name: str):
         """Update the color button appearance to show the selected color"""
@@ -1783,8 +2110,8 @@ For technical support, refer to the README.md file."""
             self.schedule_plot_update()  # Use throttled update
     
     def update_plot_display(self):
-        """Update the plot display with current data (optimized for performance)"""
-        if not hasattr(self, 'plot_widget') or self.plot_widget is None:
+        """Update the plot display with current data - Multi-Plot Aware"""
+        if not hasattr(self, 'plot_widgets') or not self.plot_widgets:
             return
         
         # Skip update if plot is paused
@@ -1792,81 +2119,75 @@ For technical support, refer to the README.md file."""
             return
             
         try:
-            # Determine x-axis data source
+            # Determine x-axis data source (remains shared for now, or per plot?)
+            # Assuming shared X-axis source for simplicity across all plots
             x_axis_channel = None
             if self.x_axis_selection != "Sample Number":
-                # Find the channel corresponding to the selected display name
+                # Find channel name ...
                 for channel_name, display_name in self.channel_custom_names.items():
                     if display_name == self.x_axis_selection:
                         x_axis_channel = channel_name
                         break
-                # If not found in custom names, check original names
                 if x_axis_channel is None and self.x_axis_selection in self.plot_data:
                     x_axis_channel = self.x_axis_selection
             
-            for channel_name, curve in self.plot_curves.items():
+            # Iterate through all curves
+            # keys are (plot_id, channel_name)
+            for (plot_id, channel_name), curve in self.plot_curves.items():
                 if channel_name in self.plot_data and self.channel_visibility.get(channel_name, True):
                     data_tuples = self.plot_data[channel_name]
                     if data_tuples:
-                        # Convert deque to list only once
                         data_list = list(data_tuples)
                         
-                        # Limit displayed data to plot_width for performance
+                        # Limit displayed data 
                         if len(data_list) > self.plot_width:
                             data_list = data_list[-self.plot_width:]
                         
                         # Get x-axis data
                         if x_axis_channel and x_axis_channel in self.plot_data:
-                            # Use selected channel for x-axis
                             x_data_tuples = list(self.plot_data[x_axis_channel])
                             if len(x_data_tuples) > self.plot_width:
                                 x_data_tuples = x_data_tuples[-self.plot_width:]
                             
-                            # Align data by sample number
                             min_length = min(len(data_list), len(x_data_tuples))
                             if min_length > 0:
                                 data_list = data_list[-min_length:]
                                 x_data_tuples = x_data_tuples[-min_length:]
                                 
-                                # Data decimation for very large datasets
+                                # Decimation
                                 if min_length > 10000:
                                     step = min_length // 5000
                                     data_list = data_list[::step]
                                     x_data_tuples = x_data_tuples[::step]
                                 
                                 if data_list and x_data_tuples:
-                                    # Extract y-data from current channel and x-data from x-axis channel
-                                    x_data = [x_sample[1] for x_sample in x_data_tuples]  # Use value, not sample number
-                                    y_data = [y_sample[1] for y_sample in data_list]
+                                    x_data = [x[1] for x in x_data_tuples]
+                                    y_data = [y[1] for y in data_list]
                                     curve.setData(x_data, y_data)
                                 else:
                                     curve.setData([], [])
                             else:
                                 curve.setData([], [])
                         else:
-                            # Use sample numbers for x-axis (default behavior)
-                            # Data decimation for very large datasets
+                            # Default Sample Number X-Axis
                             if len(data_list) > 10000:
-                                # Show every nth point when dataset is very large
-                                step = len(data_list) // 5000  # Decimate to ~5000 points max
+                                step = len(data_list) // 5000
                                 data_list = data_list[::step]
                             
-                            # Extract coordinates efficiently
                             if data_list:
-                                x_data, y_data = zip(*data_list)  # More efficient than list comprehensions
+                                x_data, y_data = zip(*data_list)
                                 curve.setData(x_data, y_data)
                             else:
                                 curve.setData([], [])
                 else:
                     curve.setData([], [])
         except Exception as e:
-            # Silently handle plot update errors
             pass
-    
+
     def show_plot_window(self):
-        """Show the plot window"""
+        """Show the multi-plot window"""
         if not PYQTGRAPH_AVAILABLE:
-            self.plot_status_label.config(text="PyQtGraph not available. Please install: pip install pyqtgraph PyQt5")
+            self.plot_status_label.config(text="PyQtGraph not available.")
             return
             
         if self.qt_app is None:
@@ -1874,171 +2195,125 @@ For technical support, refer to the README.md file."""
                 self.qt_app = QtWidgets.QApplication.instance()
                 if self.qt_app is None:
                     self.qt_app = QtWidgets.QApplication([])
-            except Exception as e:
-                self.plot_status_label.config(text=f"Error creating Qt application: {str(e)}")
+            except Exception:
                 return
         
         try:
-            if self.plot_window is None:
+            # If window is closed or needs recreation
+            if self.plot_window is None or not self.plot_window.isVisible():
                 if PYQTGRAPH_AVAILABLE:
-                    # Import the real Qt classes for inheritance
-                    from PyQt5.QtWidgets import QMainWindow
-                    
-                    # Create a custom QMainWindow class with proper close event handling
-                    class PlotWindow(QMainWindow):
-                        def __init__(self, parent_gui):
-                            super().__init__()
-                            self.parent_gui = parent_gui
-                        
-                        def closeEvent(self, event):
-                            self.parent_gui.plot_window = None
-                            self.parent_gui.plot_widget = None
-                            self.parent_gui.plot_curves.clear()
-                            self.parent_gui.plot_legend = None
-                            self.parent_gui.plot_status_label.config(text="Click 'Show Plot Window' to display real-time plots")
-                            event.accept()
-                    
-                    self.plot_window = PlotWindow(self)
-                else:
-                    # Fallback for when PyQtGraph is not available
+                    # Define PlotWindow class locally if not defined at module level
+                    # But better to use QMainWindow directly if simple
                     self.plot_window = QtWidgets.QMainWindow()
-                
-                self.plot_window.setWindowTitle("Serial Data Plot")
-                self.plot_window.setGeometry(100, 100, 800, 600)
-                
-                self.plot_widget = pg.PlotWidget()
-                
-                # Set initial plot title
-                self.update_plot_title()
-                
-                # Set initial Y-axis label
-                self.update_y_axis_label()
-                
-                # Set initial X-axis label
-                self.update_x_axis_label()
-                
-                self.plot_widget.showGrid(True, True)
-                self.plot_widget.setBackground('white')
-                
-                # Add legend using LegendItem
-                if PYQTGRAPH_AVAILABLE:
-                    try:
-                        self.plot_legend = pg.LegendItem(offset=(-70, 30))  # Negative offset for top-right
-                        self.plot_legend.setParentItem(self.plot_widget.getPlotItem())
-                    except:
-                        # Fallback if legend creation fails
-                        self.plot_legend = None
+                    self.plot_window.setWindowTitle("Serial Data Plots - Multi-View")
+                    self.plot_window.setGeometry(100, 100, 1000, 800)
+                    
+                    # Store reference to prevent GC
+                    self.plot_window._gui_ref = self 
+                    
+                    # Handle close event by monkey-patching or event filter if needed
+                    # For now just let it close, we'll rebuild next time.
+                    
+                    # Central widget with Layout
+                    central_widget = QtWidgets.QWidget()
+                    self.plot_window.setCentralWidget(central_widget)
+                    self.plot_layouts = QtWidgets.QVBoxLayout(central_widget)
                 else:
-                    self.plot_legend = None
-                
-                self.plot_window.setCentralWidget(self.plot_widget)
-                
-                # Recreate all plot curves
-                self.plot_curves = {}
-                for i, channel_name in enumerate(self.plot_data.keys()):
-                    if PYQTGRAPH_AVAILABLE:
-                        # Use custom thickness, color, dot size, and line visibility settings
-                        thickness = self.channel_thickness.get(channel_name, 2)
-                        color = self.channel_colors.get(channel_name, self.plot_colors[i % len(self.plot_colors)])
-                        dot_size = self.channel_dot_size.get(channel_name, 4)
-                        show_line = self.channel_show_line.get(channel_name, True)
-                        
-                        # Set up pen (line)
-                        pen = pg.mkPen(color=color, width=thickness) if show_line else None
-                        
-                        # Set up symbol (dots)
-                        symbol = 'o' if dot_size > 0 else None
-                        symbol_size = dot_size if dot_size > 0 else 1
-                        
-                        curve = self.plot_widget.plot(
-                            pen=pen,
-                            symbol=symbol,
-                            symbolSize=symbol_size,
-                            symbolBrush=color,
-                            name=channel_name
-                        )
-                    else:
-                        # Fallback for dummy mode
-                        color = self.channel_colors.get(channel_name, self.plot_colors[i % len(self.plot_colors)])
-                        curve = self.plot_widget.plot(pen=color, name=channel_name)
-                    self.plot_curves[channel_name] = curve
-                    # Add to legend if it exists
-                    if self.plot_legend is not None:
-                        try:
-                            display_name = self.channel_custom_names.get(channel_name, channel_name)
-                            self.plot_legend.addItem(curve, display_name)
-                        except:
-                            pass
-                
-                # Update with current data
-                self.update_plot_display()
+                    return
+
+            # Clear existing widgets from layout if any (rebuilding)
+            # Re-initialize widget dict
+            self.plot_widgets = {}
+            self.plot_curves = {}
+            self.plot_legends = {} # NEW: Track legends
             
+            # Remove old items from layout (if any, though we usually recreate window)
+            # If window exists, we might need to clear layout
+            if hasattr(self, 'plot_layouts'):
+                while self.plot_layouts.count():
+                    item = self.plot_layouts.takeAt(0)
+                    widget = item.widget()
+                    if widget is not None:
+                        widget.deleteLater()
+
+            # Determine which Plot IDs are active
+            active_plot_ids = sorted(list(set(self.channel_plot_assignments.values())))
+            if not active_plot_ids: active_plot_ids = [1]
+            
+            # Create Widgets for each active Plot ID
+            for pid in active_plot_ids:
+                # Group Label? Or just window title
+                # Let's add a small label above each plot to identify it
+                header = QtWidgets.QLabel(f"<b>Plot View {pid}</b>")
+                self.plot_layouts.addWidget(header)
+
+                p_widget = pg.PlotWidget(title="") # Title handled by header or existing logic
+                p_widget.showGrid(True, True)
+                p_widget.setBackground('white')
+                
+                # Legend - Add explicitly and store reference
+                legend = p_widget.addLegend(offset=(-10, 10))
+                self.plot_legends[pid] = legend
+                
+                # Set axis labels
+                if self.x_axis_selection == "Sample Number":
+                    p_widget.setLabel('bottom', self.x_axis_custom_label or "Sample Number")
+                else:
+                    p_widget.setLabel('bottom', self.x_axis_selection)
+                p_widget.setLabel('left', self.y_axis_custom_label or "Value")
+                
+                self.plot_layouts.addWidget(p_widget)
+                self.plot_widgets[pid] = p_widget
+                
+                # Create curves for this plot based on assignments
+                for channel_name in self.plot_data:
+                     # Check assignment
+                    assigned_pid = self.channel_plot_assignments.get(channel_name, 1)
+                    if assigned_pid != pid: continue
+
+                    # Curve setup
+                    thickness = self.channel_thickness.get(channel_name, 2)
+                    color = self.channel_colors.get(channel_name, 'k') # Default black
+                    dot_size = self.channel_dot_size.get(channel_name, 4)
+                    show_line = self.channel_show_line.get(channel_name, True)
+                    
+                    pen = pg.mkPen(color=color, width=thickness) if show_line else None
+                    symbol = 'o' if dot_size > 0 else None
+                    
+                    curve = p_widget.plot(
+                        pen=pen,
+                        symbol=symbol,
+                        symbolSize=dot_size,
+                        symbolBrush=color,
+                        name=self.channel_custom_names.get(channel_name, channel_name)
+                    )
+                    self.plot_curves[(pid, channel_name)] = curve
+
             self.plot_window.show()
             self.plot_window.raise_()
-            self.plot_status_label.config(text="Plot window is open and updating in real-time")
+            self.plot_status_label.config(text=f"Multi-Plot Window Active with {len(active_plot_ids)} plots")
             
         except Exception as e:
-            self.plot_status_label.config(text=f"Error creating plot window: {str(e)}")
-    
+            self.plot_status_label.config(text=f"Error displaying plots: {e}")
+            print(f"Plot Error: {e}") # Debug to console
+
     def clear_plot_data(self):
         """Clear plot data and buffer only, preserve all settings and UI"""
         # Clear only the actual plot data
         self.plot_data.clear()
-        self.plot_curves.clear()
         
-        # Clear channel-related data
-        self.channel_visibility.clear()
-        self.channel_thickness.clear()
-        self.channel_colors.clear()
-        self.channel_custom_names.clear()
-        self.channel_dot_size.clear()
-        self.channel_show_line.clear()
+        # Don't clear assignments or settings!
+        # Don't clear curves if we can help it, just empty data
         
         # Reset global sample counter
         self.global_sample_counter = 0
         
-        # Clear channel controls but preserve the Y-axis label frame
-        for widget in self.channel_frame.winfo_children():
-            if not isinstance(widget, tk.Frame) or not any(isinstance(child, ttk.Entry) for child in widget.winfo_children()):
-                widget.destroy()
-        
-        # Re-add Y-axis custom label frame if it was destroyed
-        if not any(isinstance(widget, tk.Frame) and any(isinstance(child, ttk.Entry) for child in widget.winfo_children()) for widget in self.channel_frame.winfo_children()):
-            ylabel_frame = tk.Frame(self.channel_frame)
-            ylabel_frame.pack(fill=tk.X, pady=(0, 10))
-            
-            ttk.Label(ylabel_frame, text="Custom Y-Axis Label:").pack(side=tk.LEFT, padx=(0, 5))
-            self.ylabel_var = tk.StringVar(value=self.y_axis_custom_label)
-            self.ylabel_entry = ttk.Entry(ylabel_frame, textvariable=self.ylabel_var, width=25)
-            self.ylabel_entry.pack(side=tk.LEFT, padx=(0, 5))
-            self.ylabel_entry.bind('<Return>', self.on_y_label_changed)
-            self.ylabel_entry.bind('<FocusOut>', self.on_y_label_changed)
-        
-        ttk.Label(self.channel_frame, text="No channels detected").pack()
-        
-        # Clear plot if window exists but preserve settings
-        if self.plot_widget is not None:
-            # Remove existing legend first
-            if hasattr(self, 'plot_legend') and self.plot_legend is not None:
-                try:
-                    self.plot_legend.setParentItem(None)
-                except:
-                    pass
-                self.plot_legend = None
-            
-            self.plot_widget.clear()
-            
-            # Recreate legend after clearing
-            if PYQTGRAPH_AVAILABLE:
-                try:
-                    self.plot_legend = pg.LegendItem(offset=(-70, 30))  # Negative offset for top-right
-                    self.plot_legend.setParentItem(self.plot_widget.getPlotItem())
-                except:
-                    self.plot_legend = None
-            else:
-                self.plot_legend = None
-        
-        self.plot_status_label.config(text="Plot data and channels cleared - axis labels preserved")
+        # Update UI to reflect empty data
+        for curve in self.plot_curves.values():
+            curve.setData([], [])
+                
+        self.plot_status_label.config(text="Plot data cleared (Channels preserved)")
+
     
     def clear_buffer_only(self):
         """Clear only plot data buffer, preserve all channels and settings"""

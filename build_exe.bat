@@ -4,13 +4,16 @@ echo Building Serial Communication GUI...
 REM Activate virtual environment
 call .venv\Scripts\activate
 
+REM Install dependencies
+pip install -r requirements.txt
+
 REM Clean previous builds
 if exist dist rmdir /s /q dist
 if exist build rmdir /s /q build
 if exist *.spec del *.spec
 
 REM Build the executable
-pyinstaller --onefile --windowed --name "SerialGUI" ^
+python -m PyInstaller --onefile --windowed --name "SerialGUI" ^
     --hidden-import "PyQt5.QtCore" ^
     --hidden-import "PyQt5.QtWidgets" ^
     --hidden-import "pyqtgraph" ^
