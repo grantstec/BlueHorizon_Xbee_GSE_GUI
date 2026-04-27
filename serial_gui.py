@@ -480,7 +480,7 @@ class SerialGUI:
         """Update the GUI labels with new telemetry data"""
         try:
             self.lbl_pt.config(text=f"{pt:.1f} PSI")
-            self.lbl_tank.config(text=f"{tank:.1f} lbs")
+            self.lbl_tank.config(text=f"{tank:.2f} lbs")
             self.lbl_engine.config(text=f"{engine:.1f} lbs")
             
             # Continuity Logic
@@ -1623,11 +1623,11 @@ For technical support, refer to the README.md file."""
                 pass
 
         # 2. Try parsing as Ground Station Telemetry
-        # [PT], [Tank], [Engine], [Cont1], [Cont2], [State]
+        # [PT], [Tank], [Engine], [Cont1], [Cont2], [State], [Timestamp(opt)]
         is_telemetry = False
         try:
             parts = raw_data.split(',')
-            if len(parts) == 6:
+            if len(parts) in [6, 7]:
                 # Attempt to parse values
                 pt = float(parts[0])
                 tank = float(parts[1])
@@ -1648,6 +1648,14 @@ For technical support, refer to the README.md file."""
                     "Cont2": cont2,
                     "State": state
                 }
+
+                # Optional Timestamp
+                if len(parts) == 7:
+                    try:
+                        timestamp = float(parts[6])  # millis()
+                        parsed_channels["Timestamp"] = timestamp
+                    except ValueError:
+                        pass
                 
                 # Update plot data
                 self.global_sample_counter += 1

@@ -1,5 +1,5 @@
 {
-  "port": "COM8",
+  "port": "COM9",
   "baud_rate": 9600,
   "data_bits": 8,
   "parity": "None",
